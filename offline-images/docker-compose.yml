@@ -1,0 +1,77 @@
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  Bxdc.ai LLM Platform — Docker Compose                                  ║
+# ║  Target: x86_64 Linux (offline intranet server)                          ║
+# ║                                                                          ║
+# ║  Services:                                                               ║
+# ║    nginx    — reverse proxy + pre-built SPA (port 80)                   ║
+# ║    backend  — FastAPI API gateway (internal port 8000)                   ║
+# ║                                                                          ║
+# ║  Quick start:                                                            ║
+# ║    docker compose up -d                                                  ║
+# ║    docker compose logs -f                                                ║
+# ║    docker compose down                                                   ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+version: "3.9"
+
+services:
+
+  # ── Backend: FastAPI API gateway ────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: bxdc-backend:latest
+    platform: linux/amd64
+    restart: unless-stopped
+    expose:
+      - "8000"
+    environment:
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-990115}
+      JWT_SECRET:     ${JWT_SECRET:-change-me-in-production-32chars!!}
+      JWT_TTL_HOURS:  ${JWT_TTL_HOURS:-12}
+      DB_PATH:        /data/bxdc.db
+      LOG_LEVEL:      ${LOG_LEVEL:-info}
+    volumes:
+      - db-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ── Nginx: reverse proxy + SPA static files ────────────────────────────
+  # Build context is the project ROOT so the Dockerfile can access both
+  # the frontend/ and nginx/ subdirectories in a single multi-stage build.
+  nginx:
+    build:
+      context: .
+      dockerfile: ./nginx/Dockerfile
+    image: bxdc-nginx:latest
+    platform: linux/amd64
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-80}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    volumes:
+      # Override the baked-in nginx.conf at runtime (convenient for tuning
+      # without rebuilding the image)
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - nginx-logs:/var/log/nginx
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+# ── Named volumes ──────────────────────────────────────────────────────────
+volumes:
+  db-data:
+    driver: local
+  nginx-logs:
+    driver: local
