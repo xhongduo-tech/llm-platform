@@ -149,7 +149,12 @@ async def chat_completions(
         raise HTTPException(status_code=503, detail=f"Model '{model_id}' has no upstream URL configured")
 
     adapted = adapt_request(body, model_record)
-    upstream_url = f"{model_record.base_url.rstrip('/')}/v1/chat/completions"
+    # Custom-format models: use base_url verbatim (user supplies the full endpoint URL).
+    # OpenAI-format models: append the standard path.
+    if model_record.import_format == "custom":
+        upstream_url = model_record.base_url
+    else:
+        upstream_url = f"{model_record.base_url.rstrip('/')}/v1/chat/completions"
     headers = build_upstream_headers(model_record)
     is_stream = adapted.get("stream", False)
 
@@ -186,7 +191,10 @@ async def embeddings(
         raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
 
     adapted = adapt_request(body, model_record)
-    upstream_url = f"{model_record.base_url.rstrip('/')}/v1/embeddings"
+    if model_record.import_format == "custom":
+        upstream_url = model_record.base_url
+    else:
+        upstream_url = f"{model_record.base_url.rstrip('/')}/v1/embeddings"
     headers = build_upstream_headers(model_record)
 
     start = time.monotonic()
@@ -244,8 +252,118 @@ async def _json_proxy(
         elif resp.status_code == 503:
             resp_body = {"error": {"message": "上游推理服务暂不可用，请稍后重试", "type": "upstream_unavailable"}}
 
+    # If the upstream didn't include a usage field (non-streaming), estimate
+    # from the request messages + response content so we never log zeros.
+    if resp.status_code == 200 and not (resp_body.get("usage") or {}):
+        completion_text = ""
+        for choice in (resp_body.get("choices") or []):
+            msg = choice.get("message") or {}
+            completion_text += str(msg.get("content") or "")
+        estimated = _estimate_usage_from_request(body, [completion_text] if completion_text else [])
+        if estimated:
+            resp_body = dict(resp_body)
+            resp_body["usage"] = estimated
+
     _log_usage(db, key_id, model_id, resp_body, resp.status_code, latency_ms)
     return JSONResponse(content=resp_body, status_code=resp.status_code)
+
+
+def _extract_usage(usage: dict) -> Optional[dict]:
+    """
+    Normalise a raw usage dict from any upstream API into our standard form.
+
+    Handles multiple field-name conventions:
+      - OpenAI / vLLM:  prompt_tokens / completion_tokens / total_tokens
+      - Anthropic style: input_tokens  / output_tokens
+      - Some open models omit total_tokens and just give the two halves.
+
+    Returns None when the dict is empty or contains no meaningful counts.
+    """
+    if not usage:
+        return None
+
+    prompt     = int(usage.get("prompt_tokens")     or usage.get("input_tokens")  or 0)
+    completion = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+    total      = int(usage.get("total_tokens")      or (prompt + completion))
+
+    # Ignore usage dicts where everything is zero (model didn't report counts)
+    if total == 0 and prompt == 0 and completion == 0:
+        return None
+
+    return {
+        "prompt_tokens":     prompt,
+        "completion_tokens": completion,
+        "total_tokens":      total,
+    }
+
+
+def _estimate_tokens(text: str) -> int:
+    """
+    Estimate token count WITHOUT a tokenizer library.
+
+    Heuristic rules (conservative but consistent):
+      - CJK characters (Chinese / Japanese / Korean + fullwidth punctuation)
+        typically tokenise 1-to-1 in modern BPE vocabularies  → count as 1 each
+      - Latin / ASCII / other  averages ≈ 4 characters per token              → divide by 4
+
+    This is used ONLY as a fallback when the upstream model doesn't return
+    usage statistics in its response (e.g. older vLLM, proprietary APIs).
+    Actual counts differ by model; the estimate is typically within ±20 %.
+    """
+    if not text:
+        return 0
+    cjk = sum(
+        1 for ch in text
+        if ('\u4e00' <= ch <= '\u9fff')    # CJK Unified Ideographs (main block)
+        or ('\u3400' <= ch <= '\u4dbf')    # CJK Extension A
+        or ('\u3000' <= ch <= '\u303f')    # CJK Symbols & Punctuation
+        or ('\uff00' <= ch <= '\uffef')    # Fullwidth / Halfwidth forms
+        or ('\u0e00' <= ch <= '\u0e7f')    # Thai
+    )
+    other = len(text) - cjk
+    return cjk + max(0, (other + 3) // 4)  # ceiling division for Latin text
+
+
+def _estimate_usage_from_request(
+    request_body: dict,
+    completion_chunks: "list[str]",
+) -> Optional[dict]:
+    """
+    Build a fallback usage estimate from the original request messages and the
+    accumulated streaming response text.
+
+    Returns None only when both sides yield 0 estimated tokens (e.g. empty
+    messages and empty response — almost certainly an error path, not a real
+    inference).
+    """
+    # --- prompt: concatenate all message content strings --------------------
+    prompt_parts: list[str] = []
+    for msg in (request_body.get("messages") or []):
+        content = msg.get("content") or ""
+        if isinstance(content, list):
+            # multimodal: extract text blocks only
+            content = " ".join(
+                block.get("text", "")
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            )
+        prompt_parts.append(str(content))
+    prompt_text = " ".join(prompt_parts)
+
+    # --- completion: join all streamed delta chunks -------------------------
+    completion_text = "".join(completion_chunks)
+
+    est_prompt     = _estimate_tokens(prompt_text)
+    est_completion = _estimate_tokens(completion_text)
+
+    if est_prompt == 0 and est_completion == 0:
+        return None
+
+    return {
+        "prompt_tokens":     est_prompt,
+        "completion_tokens": est_completion,
+        "total_tokens":      est_prompt + est_completion,
+    }
 
 
 async def _stream_proxy(
@@ -257,34 +375,80 @@ async def _stream_proxy(
     db: Session,
     start: float,
 ) -> AsyncGenerator[bytes, None]:
-    total_tokens = 0
+    # Ask the upstream to include usage in the final SSE chunk.
+    # vLLM ≥ 0.3 and most OpenAI-compatible servers honour this flag.
+    stream_body = dict(body)
+    stream_body["stream_options"] = dict(stream_body.get("stream_options") or {})
+    stream_body["stream_options"]["include_usage"] = True
+
+    usage: dict = {}
     status_code = 200
+
+    # SSE line buffer — raw TCP/HTTP chunks may not align with SSE event
+    # boundaries.  Buffer incomplete data across yields so we never miss a
+    # usage payload that was split across two consecutive aiter_bytes() calls.
+    sse_buf = ""
+
+    # Accumulate streamed content for token estimation fallback.
+    # Used when the upstream doesn't return a usage object at all (e.g. older
+    # vLLM versions, proprietary backends that omit usage stats).
+    completion_chunks: list[str] = []
 
     async with httpx.AsyncClient(timeout=300) as client:
         try:
-            async with client.stream("POST", url, headers=headers, json=body) as resp:
+            async with client.stream("POST", url, headers=headers, json=stream_body) as resp:
                 status_code = resp.status_code
                 async for chunk in resp.aiter_bytes():
                     yield chunk
-                    # Try to accumulate token counts from SSE data
+                    # Accumulate into the line buffer and process complete lines.
                     try:
-                        lines = chunk.decode().splitlines()
-                        for line in lines:
-                            if line.startswith("data:") and "[DONE]" not in line:
-                                data = json.loads(line[5:].strip())
-                                usage = data.get("usage") or {}
-                                if usage.get("total_tokens"):
-                                    total_tokens = usage["total_tokens"]
+                        sse_buf += chunk.decode(errors="replace")
+                        # Process every complete line (terminated by \n).
+                        # Leave any trailing incomplete fragment in the buffer.
+                        while "\n" in sse_buf:
+                            line, sse_buf = sse_buf.split("\n", 1)
+                            line = line.rstrip("\r")
+                            if not line.startswith("data:") or "[DONE]" in line:
+                                continue
+                            data = json.loads(line[5:].strip())
+
+                            # ① Try to get usage reported by the upstream
+                            raw_usage = data.get("usage") or {}
+                            if not raw_usage:
+                                # Some backends nest it under choices[0].delta
+                                choices = data.get("choices") or []
+                                if choices:
+                                    raw_usage = (choices[0].get("delta") or {}).get("usage") or {}
+                            normalised = _extract_usage(raw_usage)
+                            if normalised:
+                                usage = normalised   # keep the last non-zero snapshot
+
+                            # ② Collect delta content for fallback estimation
+                            for choice in (data.get("choices") or []):
+                                piece = (choice.get("delta") or {}).get("content") or ""
+                                if piece:
+                                    completion_chunks.append(piece)
                     except Exception:
-                        pass
+                        pass  # malformed / incomplete JSON — handled on next iteration
         except httpx.RequestError as e:
             _proxy_log.error("Upstream stream error | model=%s url=%s error=%s", model_id, url, e)
             error_payload = json.dumps({"error": {"message": f"上游服务器连接失败: {e}", "type": "upstream_error"}})
             yield f"data: {error_payload}\n\ndata: [DONE]\n\n".encode()
             status_code = 502
 
+    # If the upstream never returned usage stats, fall back to an estimate
+    # derived from the actual content so we never log zeros for a real call.
+    if not usage and status_code == 200:
+        estimated = _estimate_usage_from_request(body, completion_chunks)
+        if estimated:
+            usage = estimated
+            _proxy_log.debug(
+                "Usage estimated (upstream silent) | model=%s ~prompt=%d ~completion=%d",
+                model_id, estimated["prompt_tokens"], estimated["completion_tokens"],
+            )
+
     latency_ms = int((time.monotonic() - start) * 1000)
-    _log_usage(db, key_id, model_id, {"usage": {"total_tokens": total_tokens}}, status_code, latency_ms)
+    _log_usage(db, key_id, model_id, {"usage": usage}, status_code, latency_ms)
 
 
 def _log_usage(
@@ -296,13 +460,14 @@ def _log_usage(
     latency_ms: int,
 ) -> None:
     try:
-        usage = resp_body.get("usage") or {}
+        raw_usage = resp_body.get("usage") or {}
+        normalised = _extract_usage(raw_usage) or {}
         log = UsageLogORM(
             api_key_id=key_id,
             model_id=model_id,
-            prompt_tokens=str(usage.get("prompt_tokens", "")),
-            completion_tokens=str(usage.get("completion_tokens", "")),
-            total_tokens=str(usage.get("total_tokens", "")),
+            prompt_tokens=str(normalised.get("prompt_tokens", "")),
+            completion_tokens=str(normalised.get("completion_tokens", "")),
+            total_tokens=str(normalised.get("total_tokens", "")),
             latency_ms=str(latency_ms),
             status_code=str(status_code),
         )

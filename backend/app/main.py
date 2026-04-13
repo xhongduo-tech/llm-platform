@@ -228,6 +228,7 @@ def sync_models(
             existing.api_key        = m.get("apiKey", existing.api_key)
             existing.model_api_name = m.get("modelApiName", existing.model_api_name)
             existing.import_format  = m.get("importFormat", existing.import_format)
+            existing.custom_headers = m.get("customHeaders", existing.custom_headers)
         else:
             record = ModelRegistryORM(
                 id=m["id"],
@@ -263,6 +264,7 @@ def list_admin_models(
             "status": r.status, "category": r.category,
             "baseUrl": r.base_url, "modelApiName": r.model_api_name,
             "importFormat": r.import_format,
+            "customHeaders": r.custom_headers,
         }
         for r in records
     ]
@@ -323,9 +325,17 @@ def submit_application(body: ApplicationIn, db: Session = Depends(get_db)):
     }
 
 
-@app.get("/api/apply/lookup", tags=["public"])
-def lookup_keys(auth_id: str, db: Session = Depends(get_db)):
-    """Return all API keys (active + revoked) for a given authId."""
+@app.get("/api/apply/lookup", tags=["user"])
+def lookup_keys(
+    payload: dict = Depends(verify_user_token),
+    db: Session = Depends(get_db),
+):
+    """Return all API keys (active + revoked) for the authenticated user only.
+
+    The auth_id is read exclusively from the verified JWT — the caller cannot
+    supply a different auth_id to look up another user's keys.
+    """
+    auth_id = payload["sub"]
     keys = (
         db.query(ApiKeyORM)
         .filter(ApiKeyORM.auth_id == auth_id)
@@ -351,9 +361,41 @@ def list_public_models(db: Session = Depends(get_db)):
             "baseUrl": r.base_url,
             "modelApiName": r.model_api_name,
             "importFormat": r.import_format,
+            "customHeaders": r.custom_headers,
         }
         for r in records
     ]
+
+
+# ── Admin: model update (single model) ────────────────────────────────────
+
+@app.patch("/api/admin/models/{model_id}", tags=["admin"])
+def update_model(
+    model_id: str,
+    body: dict,
+    _: str = Depends(verify_admin_token),
+    db: Session = Depends(get_db),
+):
+    """Update a single model's configuration fields."""
+    record = db.query(ModelRegistryORM).get(model_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Model not found")
+
+    if "name" in body:          record.name            = body["name"]
+    if "provider" in body:      record.provider        = body["provider"]
+    if "description" in body:   record.description     = body["description"]
+    if "contextWindow" in body: record.context_window  = body["contextWindow"]
+    if "category" in body:      record.category        = body["category"]
+    if "status" in body:        record.status          = body["status"]
+    if "baseUrl" in body:       record.base_url        = body["baseUrl"] or None
+    if "modelApiName" in body:  record.model_api_name  = body["modelApiName"] or None
+    if "importFormat" in body:  record.import_format   = body["importFormat"]
+    if "customHeaders" in body: record.custom_headers  = body["customHeaders"] or None
+    # Only update api_key when explicitly provided (non-empty) to avoid clearing it
+    if body.get("apiKey"):      record.api_key         = body["apiKey"]
+
+    db.commit()
+    return {"ok": True}
 
 
 # ── Admin: model delete ────────────────────────────────────────────────────
