@@ -33,6 +33,9 @@ _STRIP_PARAMS = {
     "response_format",                    # handled selectively below
 }
 
+# For /v1/completions (FIM), keep suffix/echo/logprobs which are valid fields.
+_STRIP_PARAMS_COMPLETIONS = _STRIP_PARAMS - {"suffix", "echo", "logprobs", "best_of"}
+
 # Per-model param overrides  {model_id: {param: value}}
 _MODEL_OVERRIDES: Dict[str, Dict[str, Any]] = {
     "bge-m3":              {"encoding_format": "float"},
@@ -42,14 +45,18 @@ _MODEL_OVERRIDES: Dict[str, Dict[str, Any]] = {
 }
 
 
-def adapt_request(body: dict, model_record: ModelRegistryORM) -> dict:
+def adapt_request(
+    body: dict,
+    model_record: ModelRegistryORM,
+    for_completions: bool = False,
+) -> dict:
     """
     Normalise an incoming OpenAI-format request body for the upstream backend.
     Handles:
       - model name remapping (UI name → backend model_api_name)
       - stripping unsupported parameters
       - per-model overrides
-      - multimodal content normalisation
+      - multimodal content normalisation (chat only)
     """
     out = dict(body)
 
@@ -57,8 +64,9 @@ def adapt_request(body: dict, model_record: ModelRegistryORM) -> dict:
     if model_record.model_api_name:
         out["model"] = model_record.model_api_name
 
-    # Strip unsupported params
-    for p in _STRIP_PARAMS:
+    # Strip unsupported params — completions keeps suffix/echo/logprobs for FIM
+    strip_set = _STRIP_PARAMS_COMPLETIONS if for_completions else _STRIP_PARAMS
+    for p in strip_set:
         out.pop(p, None)
 
     # Apply per-model overrides
@@ -69,8 +77,8 @@ def adapt_request(body: dict, model_record: ModelRegistryORM) -> dict:
     if "max_tokens" in out and out["max_tokens"] is None:
         del out["max_tokens"]
 
-    # For non-vision models, strip image_url content blocks
-    if model_record.category not in ("vision", "flagship"):
+    # For non-vision models, strip image_url content blocks (chat only)
+    if not for_completions and model_record.category not in ("vision", "flagship"):
         messages = out.get("messages", [])
         for msg in messages:
             if isinstance(msg.get("content"), list):
@@ -201,6 +209,62 @@ async def embeddings(
     return await _json_proxy(upstream_url, headers, adapted, key_record.id, model_id, db, start)
 
 
+@router.post("/completions")
+async def completions(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    """
+    OpenAI-compatible /v1/completions proxy — supports FIM (Fill-In-the-Middle).
+
+    FIM models (e.g. Qwen2.5-Coder, DeepSeek-Coder) accept a ``suffix`` field
+    alongside ``prompt`` to perform code infilling.  The standard chat
+    ``/v1/chat/completions`` endpoint does not carry this field, so a dedicated
+    text-completions route is required.
+    """
+    raw_key = extract_bearer(authorization)
+    body: dict = await request.json()
+    model_id: str = body.get("model", "")
+
+    key_record = validate_api_key(raw_key, model_id, db)
+    model_record: Optional[ModelRegistryORM] = db.query(ModelRegistryORM).get(model_id)
+
+    if model_record is None or model_record.status not in ("online", "exclusive", "unstable"):
+        raise HTTPException(status_code=404, detail=f"Model '{model_id}' not available")
+
+    if not model_record.base_url:
+        raise HTTPException(status_code=503, detail=f"Model '{model_id}' has no upstream URL configured")
+
+    adapted = adapt_request(body, model_record, for_completions=True)
+    if model_record.import_format == "custom":
+        upstream_url = model_record.base_url
+    else:
+        upstream_url = f"{model_record.base_url.rstrip('/')}/v1/completions"
+    headers = build_upstream_headers(model_record)
+    is_stream = adapted.get("stream", False)
+
+    start = time.monotonic()
+
+    if is_stream:
+        return StreamingResponse(
+            _stream_proxy(
+                upstream_url, headers, adapted, key_record.id, model_id, db, start,
+                is_fim=True,
+            ),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+    else:
+        return await _json_proxy(
+            upstream_url, headers, adapted, key_record.id, model_id, db, start,
+            is_fim=True,
+        )
+
+
 # ── Internal proxy helpers ─────────────────────────────────────────────────
 
 import logging as _logging
@@ -215,6 +279,7 @@ async def _json_proxy(
     model_id: str,
     db: Session,
     start: float,
+    is_fim: bool = False,
 ) -> JSONResponse:
     model_api_name = body.get("model", model_id)
     async with httpx.AsyncClient(timeout=300) as client:
@@ -252,19 +317,35 @@ async def _json_proxy(
         elif resp.status_code == 503:
             resp_body = {"error": {"message": "上游推理服务暂不可用，请稍后重试", "type": "upstream_unavailable"}}
 
-    # If the upstream didn't include a usage field (non-streaming), estimate
-    # from the request messages + response content so we never log zeros.
-    if resp.status_code == 200 and not (resp_body.get("usage") or {}):
+    # Build log extras: error detail for non-200, response preview for 200
+    error_detail: Optional[str] = None
+    response_preview: Optional[str] = None
+
+    if resp.status_code != 200:
+        err = (resp_body.get("error") or {})
+        error_detail = (err.get("message") or str(resp_body))[:500]
+    else:
+        # Collect completion text for preview and usage estimation
         completion_text = ""
         for choice in (resp_body.get("choices") or []):
-            msg = choice.get("message") or {}
-            completion_text += str(msg.get("content") or "")
-        estimated = _estimate_usage_from_request(body, [completion_text] if completion_text else [])
-        if estimated:
-            resp_body = dict(resp_body)
-            resp_body["usage"] = estimated
+            if is_fim:
+                completion_text += str(choice.get("text") or "")
+            else:
+                msg = choice.get("message") or {}
+                completion_text += str(msg.get("content") or "")
 
-    _log_usage(db, key_id, model_id, resp_body, resp.status_code, latency_ms)
+        if completion_text:
+            response_preview = completion_text[:500]
+
+        # Fallback usage estimate when upstream omits usage field
+        if not (resp_body.get("usage") or {}):
+            estimated = _estimate_usage_from_request(body, [completion_text] if completion_text else [], is_fim=is_fim)
+            if estimated:
+                resp_body = dict(resp_body)
+                resp_body["usage"] = estimated
+
+    _log_usage(db, key_id, model_id, resp_body, resp.status_code, latency_ms,
+               error_detail=error_detail, response_preview=response_preview)
     return JSONResponse(content=resp_body, status_code=resp.status_code)
 
 
@@ -327,6 +408,7 @@ def _estimate_tokens(text: str) -> int:
 def _estimate_usage_from_request(
     request_body: dict,
     completion_chunks: "list[str]",
+    is_fim: bool = False,
 ) -> Optional[dict]:
     """
     Build a fallback usage estimate from the original request messages and the
@@ -336,19 +418,26 @@ def _estimate_usage_from_request(
     messages and empty response — almost certainly an error path, not a real
     inference).
     """
-    # --- prompt: concatenate all message content strings --------------------
-    prompt_parts: list[str] = []
-    for msg in (request_body.get("messages") or []):
-        content = msg.get("content") or ""
-        if isinstance(content, list):
-            # multimodal: extract text blocks only
-            content = " ".join(
-                block.get("text", "")
-                for block in content
-                if isinstance(block, dict) and block.get("type") == "text"
-            )
-        prompt_parts.append(str(content))
-    prompt_text = " ".join(prompt_parts)
+    if is_fim:
+        # FIM / text completions: prompt is a plain string + optional suffix
+        prompt_text = str(request_body.get("prompt") or "")
+        suffix_text = str(request_body.get("suffix") or "")
+        if suffix_text:
+            prompt_text = prompt_text + " " + suffix_text
+    else:
+        # --- prompt: concatenate all message content strings ----------------
+        prompt_parts: list[str] = []
+        for msg in (request_body.get("messages") or []):
+            content = msg.get("content") or ""
+            if isinstance(content, list):
+                # multimodal: extract text blocks only
+                content = " ".join(
+                    block.get("text", "")
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                )
+            prompt_parts.append(str(content))
+        prompt_text = " ".join(prompt_parts)
 
     # --- completion: join all streamed delta chunks -------------------------
     completion_text = "".join(completion_chunks)
@@ -374,6 +463,7 @@ async def _stream_proxy(
     model_id: str,
     db: Session,
     start: float,
+    is_fim: bool = False,
 ) -> AsyncGenerator[bytes, None]:
     # Ask the upstream to include usage in the final SSE chunk.
     # vLLM ≥ 0.3 and most OpenAI-compatible servers honour this flag.
@@ -425,7 +515,11 @@ async def _stream_proxy(
 
                             # ② Collect delta content for fallback estimation
                             for choice in (data.get("choices") or []):
-                                piece = (choice.get("delta") or {}).get("content") or ""
+                                if is_fim:
+                                    # text completions stream: content in choice.text
+                                    piece = choice.get("text") or ""
+                                else:
+                                    piece = (choice.get("delta") or {}).get("content") or ""
                                 if piece:
                                     completion_chunks.append(piece)
                     except Exception:
@@ -439,7 +533,7 @@ async def _stream_proxy(
     # If the upstream never returned usage stats, fall back to an estimate
     # derived from the actual content so we never log zeros for a real call.
     if not usage and status_code == 200:
-        estimated = _estimate_usage_from_request(body, completion_chunks)
+        estimated = _estimate_usage_from_request(body, completion_chunks, is_fim=is_fim)
         if estimated:
             usage = estimated
             _proxy_log.debug(
@@ -447,8 +541,17 @@ async def _stream_proxy(
                 model_id, estimated["prompt_tokens"], estimated["completion_tokens"],
             )
 
+    # Build log extras from accumulated stream content
+    stream_error_detail: Optional[str] = None
+    stream_response_preview: Optional[str] = None
+    if status_code != 200:
+        stream_error_detail = f"上游返回状态码 {status_code}"
+    elif completion_chunks:
+        stream_response_preview = "".join(completion_chunks)[:500]
+
     latency_ms = int((time.monotonic() - start) * 1000)
-    _log_usage(db, key_id, model_id, {"usage": usage}, status_code, latency_ms)
+    _log_usage(db, key_id, model_id, {"usage": usage}, status_code, latency_ms,
+               error_detail=stream_error_detail, response_preview=stream_response_preview)
 
 
 def _log_usage(
@@ -458,6 +561,8 @@ def _log_usage(
     resp_body: dict,
     status_code: int,
     latency_ms: int,
+    error_detail: Optional[str] = None,
+    response_preview: Optional[str] = None,
 ) -> None:
     try:
         raw_usage = resp_body.get("usage") or {}
@@ -470,6 +575,8 @@ def _log_usage(
             total_tokens=str(normalised.get("total_tokens", "")),
             latency_ms=str(latency_ms),
             status_code=str(status_code),
+            error_detail=error_detail,
+            response_preview=response_preview,
         )
         db.add(log)
         db.commit()

@@ -528,6 +528,8 @@ def list_usage(
                 "latency_ms": r.latency_ms or "0",
                 "status_code": r.status_code or "200",
                 "created_at": r.created_at.strftime("%Y-%m-%d %H:%M:%S") if r.created_at else "",
+                "error_detail": r.error_detail or "",
+                "response_preview": r.response_preview or "",
             }
             for r in records
         ],
@@ -676,6 +678,8 @@ def user_logs(
                 "latency_ms": r.latency_ms or "0",
                 "status_code": r.status_code or "200",
                 "created_at": r.created_at.strftime("%Y-%m-%d %H:%M:%S") if r.created_at else "",
+                "error_detail": r.error_detail or "",
+                "response_preview": r.response_preview or "",
             }
             for r in records
         ],

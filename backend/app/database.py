@@ -34,3 +34,20 @@ def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     from app import models as _  # noqa: F401 — import to register ORM models
     Base.metadata.create_all(bind=engine)
+    _migrate_db()
+
+
+def _migrate_db():
+    """Apply additive migrations for existing databases (ALTER TABLE ADD COLUMN)."""
+    from sqlalchemy import text
+    new_cols = [
+        "ALTER TABLE usage_logs ADD COLUMN error_detail TEXT",
+        "ALTER TABLE usage_logs ADD COLUMN response_preview TEXT",
+    ]
+    with engine.connect() as conn:
+        for sql in new_cols:
+            try:
+                conn.execute(text(sql))
+                conn.commit()
+            except Exception:
+                pass  # column already exists — safe to ignore

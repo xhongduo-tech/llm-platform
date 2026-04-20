@@ -82,6 +82,8 @@ class UsageLogORM(Base):
     latency_ms      = Column(String, nullable=True)
     status_code     = Column(String, nullable=True)
     created_at      = Column(DateTime, server_default=func.now())
+    error_detail    = Column(Text, nullable=True)    # error message for non-200 (max 500 chars)
+    response_preview = Column(Text, nullable=True)   # first 500 chars of completion text
 
 
 class NotificationORM(Base):
