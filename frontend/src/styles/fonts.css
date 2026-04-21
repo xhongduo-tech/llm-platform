@@ -1,0 +1,35 @@
+/*
+ * Fonts are bundled via npm @fontsource packages — no CDN, no wget, no curl.
+ * Vite copies the woff2 files into dist/ at build time; zero internet required
+ * at runtime on the intranet server.
+ *
+ * Inter (UI text) — variable weight 100-900, ~85 KB woff2
+ */
+@import '@fontsource-variable/inter';
+
+/*
+ * JetBrains Mono (code blocks) — only load the two weights we use
+ */
+@import '@fontsource/jetbrains-mono/400.css';
+@import '@fontsource/jetbrains-mono/500.css';
+
+/*
+ * Chinese characters — rely on the OS system font stack.
+ * Every Chinese intranet machine ships with at least one of:
+ *   PingFang SC (macOS/iOS), Microsoft YaHei (Windows),
+ *   WenQuanYi Micro Hei (Linux), Noto Sans CJK (Android/Chrome OS).
+ * @fontsource/noto-sans-sc is ~200 MB installed — too large for a build image.
+ * System fallback produces identical visual quality on all target devices.
+ */
+
+:root {
+  --font-sans: 'Inter Variable', 'Inter', -apple-system, BlinkMacSystemFont,
+    'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei',
+    'WenQuanYi Micro Hei', 'Noto Sans CJK SC', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas',
+    'Courier New', monospace;
+}
+
+html, body {
+  font-family: var(--font-sans);
+}

@@ -1,0 +1,5 @@
+@import './fonts.css';
+@import './tailwind.css';
+@import './theme.css';
+/* Must be last — overrides Tailwind for cross-browser compat */
+@import './compat.css';

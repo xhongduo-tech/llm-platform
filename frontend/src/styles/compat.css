@@ -1,0 +1,318 @@
+/*
+ * compat.css — Cross-browser compatibility overrides
+ *
+ * This file runs LAST in the CSS cascade (imported after tailwind.css and
+ * theme.css) so every rule here takes precedence over Tailwind utilities.
+ *
+ * Target: Chrome 60+, Firefox 60+, Safari 11+, Edge 18+
+ * Problems solved:
+ *  1. rounded-full → border-radius: 9999px  (polyfilled @layer breaks specificity)
+ *  2. status dots (w-[6px] h-[6px]) staying as oval
+ *  3. backdrop-filter missing -webkit- prefix
+ *  4. bg-primary/10 color-mix() not resolvable statically → explicit colours
+ *  5. overflow clipping on motion wrappers
+ *  6. font rendering for CJK on older Windows (cleartype hint)
+ */
+
+/* ── 0. CSS-only entrance animations (replace JS-driven motion.div) ─────
+ *    These run on the GPU compositor — zero JS main-thread cost.
+ *    Usage: add class "animate-enter" (fade+slide) or "animate-fade" (fade)
+ *    to replace <motion.div initial={{opacity:0,y:8}} animate={{opacity:1,y:0}}>
+ * ─────────────────────────────────────────────────────────────────────── */
+
+@-webkit-keyframes enterUp {
+  from { opacity: 0; -webkit-transform: translateY(10px); transform: translateY(10px); }
+  to   { opacity: 1; -webkit-transform: translateY(0);    transform: translateY(0); }
+}
+@keyframes enterUp {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@-webkit-keyframes fadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+/* Card stagger: nth-child delays without JS */
+.animate-enter {
+  -webkit-animation: enterUp 0.32s cubic-bezier(0.25,0.1,0.25,1) both;
+  animation:         enterUp 0.32s cubic-bezier(0.25,0.1,0.25,1) both;
+}
+.animate-fade {
+  -webkit-animation: fadeIn 0.32s ease both;
+  animation:         fadeIn 0.32s ease both;
+}
+
+/* GPU compositing hint — promotes animated elements to their own layer.     */
+/* Prevents main-thread layout reflow during opacity/transform animations.   */
+.animate-enter,
+.animate-fade,
+.panel-slide {
+  will-change: opacity, transform;
+}
+
+/* nth-child delay classes — applied to card grids */
+.anim-delay-0  { -webkit-animation-delay: 0ms;   animation-delay: 0ms; }
+.anim-delay-1  { -webkit-animation-delay: 40ms;  animation-delay: 40ms; }
+.anim-delay-2  { -webkit-animation-delay: 80ms;  animation-delay: 80ms; }
+.anim-delay-3  { -webkit-animation-delay: 120ms; animation-delay: 120ms; }
+.anim-delay-4  { -webkit-animation-delay: 160ms; animation-delay: 160ms; }
+.anim-delay-5  { -webkit-animation-delay: 200ms; animation-delay: 200ms; }
+.anim-delay-6  { -webkit-animation-delay: 240ms; animation-delay: 240ms; }
+.anim-delay-7  { -webkit-animation-delay: 280ms; animation-delay: 280ms; }
+
+/* Typing indicator dots */
+@-webkit-keyframes typingDot {
+  0%,80%,100% { opacity: 0.3; -webkit-transform: scale(0.85); transform: scale(0.85); }
+  40%         { opacity: 1;   -webkit-transform: scale(1.1);  transform: scale(1.1); }
+}
+@keyframes typingDot {
+  0%,80%,100% { opacity: 0.3; transform: scale(0.85); }
+  40%         { opacity: 1;   transform: scale(1.1); }
+}
+.typing-dot {
+  display: inline-block;
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: #8b7e74;
+  opacity: 0.3;
+  -webkit-animation: typingDot 1.2s infinite both;
+  animation:         typingDot 1.2s infinite both;
+}
+.typing-dot:nth-child(2) { -webkit-animation-delay: 0.15s; animation-delay: 0.15s; }
+.typing-dot:nth-child(3) { -webkit-animation-delay: 0.30s; animation-delay: 0.30s; }
+
+/* ── 0b. Responsive nav (replaces Tailwind hidden/md:flex) ───────────── */
+@media (min-width: 768px) {
+  .md-flex-nav {
+    display: -webkit-inline-flex !important;
+    display: inline-flex !important;
+    align-items: center;
+    gap: 4px;
+  }
+  .md-flex-nav a:hover {
+    background: var(--secondary) !important;
+    color: var(--foreground) !important;
+  }
+}
+
+/* ── 1. Force border-radius on rounded-full elements ─────────────────── */
+/*    The `!important` wins over @layer-polyfilled specificity hacks.      */
+.rounded-full,
+[class~="rounded-full"] {
+  border-radius: 9999px !important;
+}
+
+/* ── 2. Explicit status indicator dot style ──────────────────────────── */
+/*    Used in model-catalog and home-page; applied via className="dot-*"   */
+.dot-green  { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #4ade80; flex-shrink: 0; }
+.dot-amber  { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #fbbf24; flex-shrink: 0; }
+.dot-gray   { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #d1d5db; flex-shrink: 0; }
+.dot-red    { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #ef4444; flex-shrink: 0; }
+
+/* ── 3. -webkit- prefix for backdrop-filter ──────────────────────────── */
+/*    Chrome 60-75 and Safari 11-12 require the prefix.                    */
+.backdrop-blur-xl,
+.backdrop-blur-sm,
+.backdrop-blur-md,
+.backdrop-blur-lg,
+[class*="backdrop-blur"] {
+  -webkit-backdrop-filter: blur(20px);
+  backdrop-filter: blur(20px);
+}
+
+/* ── 4. Badge "推荐" explicit colour (was bg-primary/10 = color-mix) ──── */
+/*    color-mix(in srgb, var(--color-primary) 10%, transparent) can't be   */
+/*    statically expanded by PostCSS when the variable is a CSS var.        */
+.badge-recommend {
+  background-color: #fce9e2;   /* #da7757 at 10% on white */
+  color: #c96442;
+  border-radius: 9999px;
+  padding: 1px 6px;
+  font-size: 10px;
+  font-weight: 500;
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+/* ── 5. Prevent motion library from causing horizontal overflow ──────── */
+/*    Framer Motion wraps with position:relative + overflow:visible.        */
+/*    On intranet browsers, certain translateX animations leave ghost space. */
+body {
+  overflow-x: hidden;
+}
+
+/* ── 6. CJK font rendering on older Windows (GDI ClearType) ─────────── */
+/*    text-rendering: optimizeLegibility triggers full glyph re-layout on    */
+/*    every paint in Chrome 60–70 / Firefox 60–65 — noticeably slow.         */
+/*    Use `auto` here; the browser still applies ligatures on modern engines. */
+html {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: auto;
+}
+
+/* ── 6b. CJK word-break and letter-spacing reset ─────────────────────── */
+/*    Chinese text does not have spaces between words; `word-break: break-all`
+ *    prevents CJK lines from overflowing fixed-width containers.            */
+body {
+  word-break: break-word;
+  overflow-wrap: break-word;
+  -webkit-hyphens: auto;
+  hyphens: auto;
+}
+/*    Ensure no negative letter-spacing is accidentally applied to CJK text.
+ *    Latin headings that intentionally want tight tracking should add their
+ *    own `letter-spacing` inline via Tailwind `tracking-tight`.             */
+h1, h2, h3 {
+  letter-spacing: 0;
+}
+
+/* ── 7. Ensure flex/grid layout doesn't break on Edge 18 ────────────── */
+/*    Edge 18 has bugs with `gap` in flex containers — use margin instead   */
+/*    for the most critical containers (overriding per-component as needed). */
+@supports not (gap: 1px) {
+  .flex-gap-2 > * + * { margin-left: 0.5rem; }
+  .flex-gap-3 > * + * { margin-left: 0.75rem; }
+  .flex-gap-4 > * + * { margin-left: 1rem; }
+}
+
+/* ── 8. min-w-0 for text truncation (flex items) ────────────────────── */
+/*    Some old flex implementations don't respect min-width: 0 on items.   */
+.min-w-0 { min-width: 0 !important; }
+.truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ── 9. Fix translate-y on absolute-positioned elements ─────────────── */
+/*    Some older browsers need explicit -webkit-transform                   */
+.-translate-y-1\/2 {
+  -webkit-transform: translateY(-50%);
+  transform: translateY(-50%);
+}
+
+/* ── 10. line-clamp polyfill (Chrome < 73 needs -webkit-) ────────────── */
+.line-clamp-2 {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  /* fallback for browsers that support neither */
+  max-height: calc(1.6em * 2);
+}
+
+/* ── 11. Sticky header fallback ──────────────────────────────────────── */
+.sticky {
+  position: -webkit-sticky;
+  position: sticky;
+}
+
+/* ── 12b. Button loading spinner ─────────────────────────────────────── */
+@-webkit-keyframes spin {
+  to { -webkit-transform: rotate(360deg); transform: rotate(360deg); }
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+.animate-spin {
+  -webkit-animation: spin 0.7s linear infinite;
+  animation:         spin 0.7s linear infinite;
+}
+
+/* ── 12. Sonner Toast — custom style to match design system ─────────── */
+[data-sonner-toaster] [data-sonner-toast] {
+  font-size: 13px !important;
+  border-radius: 12px !important;
+  border: 1px solid rgba(0,0,0,0.08) !important;
+  box-shadow: 0 4px 24px rgba(0,0,0,0.10), 0 1px 4px rgba(0,0,0,0.06) !important;
+  padding: 12px 14px !important;
+  gap: 10px !important;
+  background: #ffffff !important;
+  color: #1a1a1a !important;
+}
+/* Success — use brand amber-orange icon */
+[data-sonner-toaster] [data-sonner-toast][data-type="success"] [data-icon] svg {
+  color: #da7757 !important;
+}
+[data-sonner-toaster] [data-sonner-toast][data-type="success"] {
+  border-color: rgba(218,119,87,0.18) !important;
+}
+/* Error — softer red */
+[data-sonner-toaster] [data-sonner-toast][data-type="error"] [data-icon] svg {
+  color: #e05757 !important;
+}
+[data-sonner-toaster] [data-sonner-toast][data-type="error"] {
+  border-color: rgba(224,87,87,0.18) !important;
+}
+/* Close button */
+[data-sonner-toaster] [data-sonner-toast] [data-close-button] {
+  border-radius: 6px !important;
+  background: #f5f0eb !important;
+  border: none !important;
+}
+/* Title */
+[data-sonner-toaster] [data-sonner-toast] [data-title] {
+  font-size: 13px !important;
+  font-weight: 500 !important;
+  line-height: 1.4 !important;
+}
+
+/* ── 13. Button tap/press effect (replaces Framer Motion whileTap) ─────── */
+.btn-tap:active {
+  -webkit-transform: scale(0.96);
+  transform: scale(0.96);
+}
+
+/* ── 14. CSS collapse — max-height accordion (replaces motion height anim) */
+.collapse-content {
+  overflow: hidden;
+  max-height: 0;
+  opacity: 0;
+  -webkit-transition: max-height 0.24s cubic-bezier(0.25,0.1,0.25,1), opacity 0.2s ease;
+  transition:         max-height 0.24s cubic-bezier(0.25,0.1,0.25,1), opacity 0.2s ease;
+}
+.collapse-content.collapse-open {
+  max-height: 2400px;   /* large enough for any content */
+  opacity: 1;
+}
+
+/* ── 15. Tooltip fade (replaces Framer Motion AnimatePresence tooltip) ─── */
+.tooltip-fade {
+  opacity: 0;
+  pointer-events: none;
+  -webkit-transition: opacity 0.15s ease;
+  transition:         opacity 0.15s ease;
+}
+.tooltip-fade.tooltip-visible {
+  opacity: 1;
+}
+
+/* ── 16. Step indicator transitions (replaces motion.div color animation) */
+.step-dot {
+  -webkit-transition: background-color 0.3s, color 0.3s;
+  transition:         background-color 0.3s, color 0.3s;
+}
+.step-line {
+  height: 1px;
+  -webkit-transition: background-color 0.3s;
+  transition:         background-color 0.3s;
+}
+
+/* ── 17. Panel slide (replaces AnimatePresence mode=wait x-slide) ───────── */
+.panel-slide {
+  -webkit-animation: panelEnter 0.22s cubic-bezier(0.25,0.1,0.25,1) both;
+  animation:         panelEnter 0.22s cubic-bezier(0.25,0.1,0.25,1) both;
+}
+@-webkit-keyframes panelEnter {
+  from { opacity: 0; -webkit-transform: translateX(14px); transform: translateX(14px); }
+  to   { opacity: 1; -webkit-transform: translateX(0);    transform: translateX(0); }
+}
+@keyframes panelEnter {
+  from { opacity: 0; transform: translateX(14px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
